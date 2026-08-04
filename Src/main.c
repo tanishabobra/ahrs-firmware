@@ -4,6 +4,26 @@
   #warning "FPU is not initialized, but the project is compiling for an FPU. Please initialize the FPU before use."
 #endif
 
+// ---- SysTick (1ms system tick, built into the Cortex-M4 core -- no RCC enable needed) ----
+
+#define SYST_CSR  (*(volatile uint32_t*) 0xE000E010)
+#define SYST_RVR  (*(volatile uint32_t*) 0xE000E014)
+#define SYST_CVR  (*(volatile uint32_t*) 0xE000E018)
+
+volatile uint32_t system_ticks_ms = 0;  // incremented every 1ms by SysTick_Handler below
+
+void SysTick_Init(void)
+{
+	SYST_RVR = 15999;              // count down from here to 0 -> exactly 1ms at 16MHz
+	SYST_CVR = 0;                  // clear current value before starting
+	SYST_CSR = (1 << 0) | (1 << 1) | (1 << 2);  // ENABLE + TICKINT + CLKSOURCE=CPU clock
+}
+
+void SysTick_Handler(void)
+{
+	system_ticks_ms++;   // must stay fast/simple -- runs automatically every 1ms, pausing main()
+}
+
 // ---- LED helpers (LD2, onboard green LED, PA5) ----
 
 void LED_Init(void)
@@ -177,6 +197,9 @@ int main(void)
 	*(volatile uint32_t*) 0x40005420 = 17;
 	*(volatile uint32_t*) 0x40005400 |= (1 << 0);
 
+	// ---- SysTick: start the 1ms system clock ----
+	SysTick_Init();
+
 	// ---- Startup self-test ----
 	LED_Init();
 
@@ -235,5 +258,5 @@ int main(void)
 	int16_t mag_y = (int16_t)((mag_raw[3] << 8) | mag_raw[2]);
 	int16_t mag_z = (int16_t)((mag_raw[5] << 8) | mag_raw[4]);
 
-	for(;;);
+	for(;;);   // set a breakpoint on this line to watch system_ticks_ms climb
 }
