@@ -4,27 +4,54 @@
   #warning "FPU is not initialized, but the project is compiling for an FPU. Please initialize the FPU before use."
 #endif
 
+// ---- LED helpers (LD2, onboard green LED, PA5) ----
+
+void LED_Init(void)
+{
+	*(volatile uint32_t*) 0x40023830 |= (1 << 0);    // RCC_AHB1ENR bit0 -> power on GPIOA
+	*(volatile uint32_t*) 0x40020000 &= ~(3 << 10);  // GPIOA_MODER: clear PA5's mode bits
+	*(volatile uint32_t*) 0x40020000 |=  (1 << 10);  // GPIOA_MODER: PA5 -> output mode ('01')
+}
+
+void LED_On(void)  { *(volatile uint32_t*) 0x40020014 |=  (1 << 5); } // GPIOA_ODR: PA5 high -> LED on
+void LED_Off(void) { *(volatile uint32_t*) 0x40020014 &= ~(1 << 5); } // GPIOA_ODR: PA5 low -> LED off
+
+// Blinks `count` times, pauses, repeats forever. Never returns -- a failed
+// self-test is a terminal state, there's no safe "normal operation" to fall into.
+void LED_Blink_Error(uint8_t count)
+{
+	for (;;) {
+		for (uint8_t i = 0; i < count; i++) {
+			LED_On();
+			for (volatile int d = 0; d < 500000; d++);  // on-time
+			LED_Off();
+			for (volatile int d = 0; d < 500000; d++);  // off-time
+		}
+		for (volatile int d = 0; d < 2000000; d++);  // longer pause between repeats
+	}
+}
+
 // ---- MPU-6050/6500 helpers (unchanged, already proven working) ----
 
 uint32_t I2C_ReadRegister(uint8_t reg_addr)
 {
 	uint32_t value;
-	*(volatile uint32_t*) 0x40005400 |= (1<<10);
-	*(volatile uint32_t*) 0x40005400 |= (1<<8);
+	*(volatile uint32_t*) 0x40005400 |= (1<<10); // I2C1_CR1: ACK on
+	*(volatile uint32_t*) 0x40005400 |= (1<<8);  // I2C1_CR1: START
+	while( ((*(volatile uint32_t*) 0x40005414) & (1 << 0)) == 0 ){} // wait SB
+	*(volatile uint32_t*) 0x40005410 = 0xD0;     // send MPU address, write direction
+	while( ((*(volatile uint32_t*) 0x40005414) & (1 << 1)) == 0 ){} // wait ADDR
+	*(volatile uint32_t*) 0x40005418; // clear ADDR (dummy read SR2)
+	*(volatile uint32_t*) 0x40005410 = reg_addr; // register to read
+	while( ((*(volatile uint32_t*) 0x40005414) & (1 << 2)) == 0 ){} // wait BTF
+	*(volatile uint32_t*) 0x40005400 |= (1<<8);  // repeated START -> switch to read
 	while( ((*(volatile uint32_t*) 0x40005414) & (1 << 0)) == 0 ){}
-	*(volatile uint32_t*) 0x40005410 = 0xD0;
+	*(volatile uint32_t*) 0x40005410 = 0xD1;     // send address, read direction
 	while( ((*(volatile uint32_t*) 0x40005414) & (1 << 1)) == 0 ){}
-	*(volatile uint32_t*) 0x40005418;
-	*(volatile uint32_t*) 0x40005410 = reg_addr;
-	while( ((*(volatile uint32_t*) 0x40005414) & (1 << 2)) == 0 ){}
-	*(volatile uint32_t*) 0x40005400 |= (1<<8);
-	while( ((*(volatile uint32_t*) 0x40005414) & (1 << 0)) == 0 ){}
-	*(volatile uint32_t*) 0x40005410 = 0xD1;
-	while( ((*(volatile uint32_t*) 0x40005414) & (1 << 1)) == 0 ){}
-	*(volatile uint32_t*) 0x40005400 &= ~(1 << 10);
-	*(volatile uint32_t*) 0x40005418;
-	*(volatile uint32_t*) 0x40005400 |= (1<<9);
-	while( ((*(volatile uint32_t*) 0x40005414) & (1 << 6)) == 0 ){}
+	*(volatile uint32_t*) 0x40005400 &= ~(1 << 10); // clear ACK -> NACK the one incoming byte
+	*(volatile uint32_t*) 0x40005418; // clear ADDR
+	*(volatile uint32_t*) 0x40005400 |= (1<<9); // queue STOP
+	while( ((*(volatile uint32_t*) 0x40005414) & (1 << 6)) == 0 ){} // wait RxNE
 	value = *(volatile uint32_t*) 0x40005410;
 	return value;
 }
@@ -47,6 +74,7 @@ void I2C_ReadMulti(uint8_t reg_addr, uint8_t *buffer, uint8_t len)
 	*(volatile uint32_t*) 0x40005418;
 	for (uint8_t i = 0; i < len; i++) {
 		if (i == len - 1) {
+			// N-1 trick: clear ACK + queue STOP right before the last byte
 			*(volatile uint32_t*) 0x40005400 &= ~(1 << 10);
 			*(volatile uint32_t*) 0x40005400 |= (1 << 9);
 		}
@@ -122,6 +150,7 @@ void QMC_ReadMulti(uint8_t reg_addr, uint8_t *buffer, uint8_t len)
 
 int main(void)
 {
+	// ---- GPIOB clock + pin config for I2C1 (PB8=SCL, PB9=SDA) ----
 	*(volatile uint32_t*) 0x40023830 |= (1 << 1);
 	*(volatile uint32_t*) 0x40020400 &= ~((3 << 16) | (3 << 18));
 	*(volatile uint32_t*) 0x40020400 |=  ((2 << 16) | (2 << 18));
@@ -134,11 +163,13 @@ int main(void)
 	*(volatile uint32_t*) 0x40020424 |=  (4 << 0);
 	*(volatile uint32_t*) 0x40020424 |=  (4 << 4);
 
+	// ---- I2C1 clock enable + peripheral reset ----
 	*(volatile uint32_t*) 0x40023840 |= (1 << 21);
 	*(volatile uint32_t*) 0x40023820 |= (1 << 21);
 	for (volatile int d = 0; d < 10000; d++);
 	*(volatile uint32_t*) 0x40023820 &= ~(1 << 21);
 
+	// ---- I2C1 peripheral configuration ----
 	*(volatile uint32_t*) 0x40005400 = 0;
 	*(volatile uint32_t*) 0x40005408 = (1 << 14);
 	*(volatile uint32_t*) 0x40005404 = 16;
@@ -146,9 +177,22 @@ int main(void)
 	*(volatile uint32_t*) 0x40005420 = 17;
 	*(volatile uint32_t*) 0x40005400 |= (1 << 0);
 
-	uint32_t who_am_i = I2C_ReadRegister(0x75);
+	// ---- Startup self-test ----
+	LED_Init();
 
-	// Wake the MPU-6050/6500
+	uint8_t mpu_ok = (I2C_ReadRegister(0x75) == 0x70);  // WHO_AM_I should be 0x70
+	uint8_t qmc_ok = (QMC_ReadRegister(0x0D) == 0xFF);  // Chip ID should be 0xFF
+
+	if (!mpu_ok && !qmc_ok) {
+		LED_Blink_Error(3);   // both sensors failed
+	} else if (!mpu_ok) {
+		LED_Blink_Error(1);   // only MPU failed
+	} else if (!qmc_ok) {
+		LED_Blink_Error(2);   // only QMC failed
+	}
+	// if we reach here, both sensors passed -- continue as normal
+
+	// ---- Wake the MPU-6050/6500 ----
 	*(volatile uint32_t*) 0x40005400 |= (1<<8);
 	while( ((*(volatile uint32_t*) 0x40005414) & (1 << 0)) == 0 ){}
 	*(volatile uint32_t*) 0x40005410 = 0xD0;
@@ -176,36 +220,20 @@ int main(void)
 	int16_t gyro_y = (int16_t)((gyro_raw[2] << 8) | gyro_raw[3]);
 	int16_t gyro_z = (int16_t)((gyro_raw[4] << 8) | gyro_raw[5]);
 
-	//----------------------------------------------------
-	// QMC5883L: Chip ID check first (register 0x0D, should read 0xFF)
-	//----------------------------------------------------
+	// ---- QMC5883L: configure and wake into continuous mode ----
+	QMC_WriteRegister(0x0B, 0x01);
+	QMC_WriteRegister(0x09, 0x49);
 
-	uint32_t chip_id = QMC_ReadRegister(0x0D);
+	for (volatile int d = 0; d < 20000; d++);
 
-	//----------------------------------------------------
-	// QMC5883L: configure and wake into continuous mode
-	//----------------------------------------------------
+	uint32_t mode_check = QMC_ReadRegister(0x09);
 
-	QMC_WriteRegister(0x0B, 0x01);  // SET/RESET period — datasheet-recommended
-	QMC_WriteRegister(0x09, 0x49);  // Control Reg 1: OSR=256, RNG=2G, ODR=100Hz, MODE=Continuous
-
-	for (volatile int d = 0; d < 20000; d++);  // brief settle time after mode change
-
-	uint32_t mode_check = QMC_ReadRegister(0x09);  // should read back as 0x49
-
-	//----------------------------------------------------
-	// QMC5883L: read magnetometer data
-	// NOTE: register order is LSB-first (X_LSB, X_MSB, Y_LSB, Y_MSB, Z_LSB, Z_MSB)
-	// — opposite of the MPU-6050/HMC5883L, which are MSB-first
-	//----------------------------------------------------
-
+	// ---- QMC5883L: read magnetometer data (LSB-first, opposite of MPU) ----
 	uint8_t mag_raw[6];
 	QMC_ReadMulti(0x00, mag_raw, 6);
-
 	int16_t mag_x = (int16_t)((mag_raw[1] << 8) | mag_raw[0]);
 	int16_t mag_y = (int16_t)((mag_raw[3] << 8) | mag_raw[2]);
 	int16_t mag_z = (int16_t)((mag_raw[5] << 8) | mag_raw[4]);
 
-	/* Loop forever — check chip_id, mode_check, mag_x, mag_y, mag_z here */
 	for(;;);
 }
