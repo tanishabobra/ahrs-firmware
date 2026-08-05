@@ -5,20 +5,25 @@
   #warning "FPU is not initialized, but the project is compiling for an FPU. Please initialize the FPU before use."
 #endif
 
-#define RAD_TO_DEG 57.29578f  // 180/pi -- converts atan2's radians output into degrees
-
-// ---- FPU enable (Cortex-M4 FPU is OFF by default) ----
+#define RAD_TO_DEG 57.29578f
 
 #define CPACR (*(volatile uint32_t*) 0xE000ED88)
 
 void FPU_Enable(void)
 {
-	CPACR |= (0xF << 20);          // full access to CP10/CP11 -- the FPU's coprocessor slots
-	__asm volatile ("dsb");        // wait for that write to actually complete
-	__asm volatile ("isb");        // flush the pipeline so no stale float instruction sneaks through
+	CPACR |= (0xF << 20);
+	__asm volatile ("dsb");
+	__asm volatile ("isb");
 }
 
-// ---- SysTick (1ms system tick) ----
+// Stable breakpoint target -- set a breakpoint on this FUNCTION NAME
+// (Run -> Add Function Breakpoint... -> "DebugCheckpoint"), not by line
+// number. Function-name breakpoints survive rebuilds even when line
+// numbers shift; line-number breakpoints do not.
+void DebugCheckpoint(void)
+{
+	__asm volatile ("nop");
+}
 
 #define SYST_CSR  (*(volatile uint32_t*) 0xE000E010)
 #define SYST_RVR  (*(volatile uint32_t*) 0xE000E014)
@@ -37,12 +42,6 @@ void SysTick_Handler(void)
 {
 	system_ticks_ms++;
 }
-
-// ---- I2C1 timeout/recovery helpers ----
-// The STM32F4 I2C1 peripheral can wedge (stuck waiting on a flag that never
-// sets) if a new transaction starts too soon after the last one ends. We
-// wait up to a large-but-finite limit instead of forever; if exceeded, we
-// assume the peripheral is wedged and reset it from scratch.
 
 #define I2C_TIMEOUT_LIMIT 100000
 
@@ -71,10 +70,8 @@ static void I2C1_Recover(void)
 
 static void I2C_BusFreeDelay(void)
 {
-	for (volatile int d = 0; d < 1000; d++);  // required bus-free gap after STOP, before next START
+	for (volatile int d = 0; d < 1000; d++);
 }
-
-// ---- LED helpers (LD2, onboard green LED, PA5) ----
 
 void LED_Init(void)
 {
@@ -98,8 +95,6 @@ void LED_Blink_Error(uint8_t count)
 		for (volatile int d = 0; d < 2000000; d++);
 	}
 }
-
-// ---- MPU-6050/6500 helpers (timeout + recovery) ----
 
 uint32_t I2C_ReadRegister(uint8_t reg_addr)
 {
@@ -153,8 +148,6 @@ void I2C_ReadMulti(uint8_t reg_addr, uint8_t *buffer, uint8_t len)
 	while( (*(volatile uint32_t*) 0x40005400) & (1 << 9) ){}
 	I2C_BusFreeDelay();
 }
-
-// ---- QMC5883L helpers (timeout + recovery) ----
 
 void QMC_WriteRegister(uint8_t reg_addr, uint8_t value)
 {
@@ -227,9 +220,8 @@ void QMC_ReadMulti(uint8_t reg_addr, uint8_t *buffer, uint8_t len)
 
 int main(void)
 {
-	FPU_Enable();   // MUST be first -- enables float hardware before any float math runs below
+	FPU_Enable();
 
-	// ---- GPIOB clock + pin config for I2C1 (PB8=SCL, PB9=SDA) ----
 	*(volatile uint32_t*) 0x40023830 |= (1 << 1);
 	*(volatile uint32_t*) 0x40020400 &= ~((3 << 16) | (3 << 18));
 	*(volatile uint32_t*) 0x40020400 |=  ((2 << 16) | (2 << 18));
@@ -242,13 +234,11 @@ int main(void)
 	*(volatile uint32_t*) 0x40020424 |=  (4 << 0);
 	*(volatile uint32_t*) 0x40020424 |=  (4 << 4);
 
-	// ---- I2C1 clock enable + peripheral reset ----
 	*(volatile uint32_t*) 0x40023840 |= (1 << 21);
 	*(volatile uint32_t*) 0x40023820 |= (1 << 21);
 	for (volatile int d = 0; d < 10000; d++);
 	*(volatile uint32_t*) 0x40023820 &= ~(1 << 21);
 
-	// ---- I2C1 peripheral configuration ----
 	*(volatile uint32_t*) 0x40005400 = 0;
 	*(volatile uint32_t*) 0x40005408 = (1 << 14);
 	*(volatile uint32_t*) 0x40005404 = 16;
@@ -256,13 +246,11 @@ int main(void)
 	*(volatile uint32_t*) 0x40005420 = 17;
 	*(volatile uint32_t*) 0x40005400 |= (1 << 0);
 
-	// ---- SysTick: start the 1ms system clock ----
 	SysTick_Init();
 
-	// ---- Startup self-test ----
 	LED_Init();
 
-	uint8_t mpu_ok = (I2C_ReadRegister(0x75) == 0x70);  // 0x70 -- this board's actual chip is an MPU-6500, verified via logic analyzer
+	uint8_t mpu_ok = (I2C_ReadRegister(0x75) == 0x70);
 	uint8_t qmc_ok = (QMC_ReadRegister(0x0D) == 0xFF);
 
 	if (!mpu_ok && !qmc_ok) {
@@ -273,7 +261,6 @@ int main(void)
 		LED_Blink_Error(2);
 	}
 
-	// ---- Wake the MPU-6050/6500 ----
 	*(volatile uint32_t*) 0x40005400 |= (1<<8);
 	while( ((*(volatile uint32_t*) 0x40005414) & (1 << 0)) == 0 ){}
 	*(volatile uint32_t*) 0x40005410 = 0xD0;
@@ -289,15 +276,12 @@ int main(void)
 
 	for (volatile int d = 0; d < 20000; d++);
 
-	// ---- QMC5883L: configure and wake into continuous mode ----
 	QMC_WriteRegister(0x0B, 0x01);
 	QMC_WriteRegister(0x09, 0x49);
 
 	for (volatile int d = 0; d < 20000; d++);
 
-	// ================= Complementary filter setup =================
-
-	float alpha = 0.98f;  // trust gyro's short-term smoothness; let accel slowly correct drift
+	float alpha = 0.98f;
 
 	uint8_t accel_raw[6];
 	I2C_ReadMulti(0x3B, accel_raw, 6);
@@ -307,7 +291,6 @@ int main(void)
 
 	uint32_t last_ticks = system_ticks_ms;
 
-	// ================= Main filter loop =================
 	for (;;) {
 		uint32_t now_ticks = system_ticks_ms;
 		uint32_t elapsed_ms = now_ticks - last_ticks;
@@ -326,8 +309,6 @@ int main(void)
 
 		angle = alpha * (angle + gyro_rate_dps * dt) + (1.0f - alpha) * accel_angle;
 
-		// angle now holds the current roll estimate, in degrees.
-		// Set a breakpoint below and watch it in Expressions while tilting the board.
-		(void)angle;
+		DebugCheckpoint();  // breakpoint by FUNCTION NAME, not line number -- survives rebuilds
 	}
 }
