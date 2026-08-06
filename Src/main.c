@@ -571,6 +571,181 @@ void Quat_ToEuler(const float q[4], float *pitch_deg, float *roll_deg, float *ya
 	if (*yaw_deg < 0.0f) *yaw_deg += 360.0f;
 }
 
+// ================= GPS UART (USART2, PA2=TX/PA3=RX) + NMEA parsing =================
+// Uses USART2 because the physical wire is on the pin labeled "RX" (D0),
+// which is PA3 -- part of USART2, not USART1.
+
+#define USART2_SR   (*(volatile uint32_t*) 0x40004400)
+#define USART2_DR   (*(volatile uint32_t*) 0x40004404)
+#define USART2_BRR  (*(volatile uint32_t*) 0x40004408)
+#define USART2_CR1  (*(volatile uint32_t*) 0x4000440C)
+
+void GPS_UART_Init(void)
+{
+	*(volatile uint32_t*) 0x40023830 |= (1 << 0);   // GPIOA clock (idempotent)
+
+	// PA2 = TX, PA3 = RX, Alternate Function mode
+	*(volatile uint32_t*) 0x40020000 &= ~((3 << 4) | (3 << 6));
+	*(volatile uint32_t*) 0x40020000 |=  ((2 << 4) | (2 << 6));
+
+	// High speed
+	*(volatile uint32_t*) 0x40020008 &= ~((3 << 4) | (3 << 6));
+	*(volatile uint32_t*) 0x40020008 |=  ((3 << 4) | (3 << 6));
+
+	// AFRL: AF7 = USART2 -- pin2 (TX) bits[11:8], pin3 (RX) bits[15:12]
+	*(volatile uint32_t*) 0x40020020 &= ~((0xF << 8) | (0xF << 12));
+	*(volatile uint32_t*) 0x40020020 |=  ((7 << 8) | (7 << 12));
+
+	*(volatile uint32_t*) 0x40023840 |= (1 << 17);   // RCC_APB1ENR: USART2EN
+
+	USART2_CR1 = 0;
+	USART2_BRR = 0x683;         // 9600 baud @ 16MHz APB1 clock
+	USART2_CR1 |= (1 << 3);     // TE
+	USART2_CR1 |= (1 << 2);     // RE
+	USART2_CR1 |= (1 << 13);    // UE, last
+}
+
+static uint8_t GPS_UART_ByteAvailable(void)
+{
+	return (USART2_SR & (1 << 5)) != 0;   // RXNE
+}
+
+static uint8_t GPS_UART_ReadByte(void)
+{
+	return (uint8_t)(USART2_DR & 0xFF);
+}
+
+#define NMEA_BUF_SIZE 96
+static char nmea_buf[NMEA_BUF_SIZE];
+static uint8_t nmea_idx = 0;
+static volatile uint8_t nmea_sentence_ready = 0;
+
+// Call once per main loop iteration.
+
+void GPS_UART_Poll(void)
+{
+	if (!GPS_UART_ByteAvailable()) return;
+
+	uint8_t c = GPS_UART_ReadByte();
+	if (c == '\n') {
+		nmea_buf[nmea_idx] = '\0';
+		nmea_sentence_ready = 1;
+		nmea_idx = 0;
+	} else if (c != '\r') {
+		if (nmea_idx < NMEA_BUF_SIZE - 1) {
+			nmea_buf[nmea_idx++] = c;
+		} else {
+			nmea_idx = 0;
+		}
+	}
+}
+
+static uint8_t NMEA_GetField(const char *sentence, uint8_t field_index, char *out, uint8_t out_size)
+{
+	uint8_t current_field = 0;
+	uint8_t out_pos = 0;
+	const char *p = sentence;
+
+	while (*p != '\0' && current_field < field_index) {
+		if (*p == ',') current_field++;
+		p++;
+	}
+	if (current_field != field_index) {
+		out[0] = '\0';
+		return 0;
+	}
+
+	while (*p != '\0' && *p != ',' && *p != '*' && out_pos < out_size - 1) {
+		out[out_pos++] = *p++;
+	}
+	out[out_pos] = '\0';
+	return 1;
+}
+
+static float NMEA_ParseFloat(const char *raw)
+{
+	uint8_t i = 0;
+	uint8_t negative = 0;
+	float whole = 0.0f;
+
+	if (raw[i] == '-') { negative = 1; i++; }
+
+	while (raw[i] != '\0' && raw[i] != '.') {
+		whole = whole * 10.0f + (float)(raw[i] - '0');
+		i++;
+	}
+	if (raw[i] == '.') {
+		i++;
+		float frac = 0.1f;
+		while (raw[i] != '\0') {
+			whole = whole + (float)(raw[i] - '0') * frac;
+			frac = frac * 0.1f;
+			i++;
+		}
+	}
+	if (negative) whole = -whole;
+	return whole;
+}
+
+static float NMEA_ToDecimalDegrees(const char *raw, char hemisphere)
+{
+	float whole = NMEA_ParseFloat(raw);
+
+	int degrees_int = (int)(whole / 100.0f);
+	float degrees_part = (float)degrees_int;
+	float minutes_part = whole - degrees_part * 100.0f;
+	float decimal_deg = degrees_part + (minutes_part / 60.0f);
+
+	if (hemisphere == 'S' || hemisphere == 'W') {
+		decimal_deg = -decimal_deg;
+	}
+	return decimal_deg;
+}
+
+static uint8_t NMEA_IsGGA(const char *sentence)
+{
+	if (sentence[0] != '$') return 0;
+	return (sentence[3] == 'G' && sentence[4] == 'G' && sentence[5] == 'A');
+}
+
+typedef struct {
+	float latitude;
+	float longitude;
+	float altitude_m;
+	uint8_t fix_quality;
+	uint8_t satellites;
+	uint8_t valid;
+} GPS_Fix;
+
+void NMEA_ParseGGA(const char *sentence, GPS_Fix *fix)
+{
+	char field[16];
+
+	NMEA_GetField(sentence, 6, field, sizeof(field));
+	fix->fix_quality = (uint8_t)(field[0] - '0');
+	fix->valid = (fix->fix_quality > 0);
+
+	if (!fix->valid) return;
+
+	char lat_raw[16], lat_hem[2];
+	NMEA_GetField(sentence, 2, lat_raw, sizeof(lat_raw));
+	NMEA_GetField(sentence, 3, lat_hem, sizeof(lat_hem));
+	fix->latitude = NMEA_ToDecimalDegrees(lat_raw, lat_hem[0]);
+
+	char lon_raw[16], lon_hem[2];
+	NMEA_GetField(sentence, 4, lon_raw, sizeof(lon_raw));
+	NMEA_GetField(sentence, 5, lon_hem, sizeof(lon_hem));
+	fix->longitude = NMEA_ToDecimalDegrees(lon_raw, lon_hem[0]);
+
+	char sat_raw[8];
+	NMEA_GetField(sentence, 7, sat_raw, sizeof(sat_raw));
+	fix->satellites = (uint8_t)NMEA_ParseFloat(sat_raw);
+
+	char alt_raw[16];
+	NMEA_GetField(sentence, 9, alt_raw, sizeof(alt_raw));
+	fix->altitude_m = NMEA_ParseFloat(alt_raw);
+}
+
 int main(void)
 {
 	FPU_Enable();
@@ -602,6 +777,7 @@ int main(void)
 	SysTick_Init();
 
 	LED_Init();
+	GPS_UART_Init();
 
 	uint8_t mpu_ok = (I2C_ReadRegister(0x75) == 0x70);
 	uint8_t qmc_ok = (QMC_ReadRegister(0x0D) == 0xFF);
@@ -645,6 +821,8 @@ int main(void)
 	EKF_State ekf;
 	EKF_Init(&ekf, init_pitch, init_roll);
 
+	GPS_Fix gps_fix = {0};
+
 	uint32_t last_ticks = system_ticks_ms;
 
 	for (;;) {
@@ -673,7 +851,6 @@ int main(void)
 		float gyro_z_rad = gyro_z_dps * DEG_TO_RAD;
 
 		EKF_Predict(&ekf, gyro_x_rad, gyro_y_rad, gyro_z_rad, dt);
-
 		EKF_UpdateAccel(&ekf, (float)accel_x, (float)accel_y, (float)accel_z);
 
 		uint8_t mag_raw[6];
@@ -686,6 +863,14 @@ int main(void)
 
 		float pitch_deg, roll_deg, yaw_deg;
 		Quat_ToEuler(ekf.q, &pitch_deg, &roll_deg, &yaw_deg);
+
+		GPS_UART_Poll();
+		if (nmea_sentence_ready) {
+			if (NMEA_IsGGA(nmea_buf)) {
+				NMEA_ParseGGA(nmea_buf, &gps_fix);
+			}
+			nmea_sentence_ready = 0;
+		}
 
 		DebugCheckpoint();
 	}
