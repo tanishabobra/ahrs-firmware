@@ -6,6 +6,7 @@
 #endif
 
 #define RAD_TO_DEG 57.29578f
+#define DEG_TO_RAD 0.01745329f
 
 #define CPACR (*(volatile uint32_t*) 0xE000ED88)
 
@@ -16,10 +17,6 @@ void FPU_Enable(void)
 	__asm volatile ("isb");
 }
 
-// Stable breakpoint target -- set a breakpoint on this FUNCTION NAME
-// (Run -> Add Function Breakpoint... -> "DebugCheckpoint"), not by line
-// number. Function-name breakpoints survive rebuilds even when line
-// numbers shift; line-number breakpoints do not.
 void DebugCheckpoint(void)
 {
 	__asm volatile ("nop");
@@ -286,8 +283,10 @@ int main(void)
 	uint8_t accel_raw[6];
 	I2C_ReadMulti(0x3B, accel_raw, 6);
 	int16_t accel_x = (int16_t)((accel_raw[0] << 8) | accel_raw[1]);
+	int16_t accel_y = (int16_t)((accel_raw[2] << 8) | accel_raw[3]);
 	int16_t accel_z = (int16_t)((accel_raw[4] << 8) | accel_raw[5]);
-	float angle = atan2f((float)accel_x, (float)accel_z) * RAD_TO_DEG;
+	float pitch = atan2f((float)accel_x, (float)accel_z) * RAD_TO_DEG;
+	float roll  = atan2f((float)accel_y, (float)accel_z) * RAD_TO_DEG;
 
 	uint32_t last_ticks = system_ticks_ms;
 
@@ -299,16 +298,53 @@ int main(void)
 
 		I2C_ReadMulti(0x3B, accel_raw, 6);
 		accel_x = (int16_t)((accel_raw[0] << 8) | accel_raw[1]);
+		accel_y = (int16_t)((accel_raw[2] << 8) | accel_raw[3]);
 		accel_z = (int16_t)((accel_raw[4] << 8) | accel_raw[5]);
-		float accel_angle = atan2f((float)accel_x, (float)accel_z) * RAD_TO_DEG;
+		float pitch_accel = atan2f((float)accel_x, (float)accel_z) * RAD_TO_DEG;
+		float roll_accel  = atan2f((float)accel_y, (float)accel_z) * RAD_TO_DEG;
 
 		uint8_t gyro_raw[6];
 		I2C_ReadMulti(0x43, gyro_raw, 6);
 		int16_t gyro_x = (int16_t)((gyro_raw[0] << 8) | gyro_raw[1]);
-		float gyro_rate_dps = gyro_x / 131.0f;
+		int16_t gyro_y = (int16_t)((gyro_raw[2] << 8) | gyro_raw[3]);
+		float pitch_rate_dps = gyro_x / 131.0f;
+		float roll_rate_dps  = gyro_y / 131.0f;
 
-		angle = alpha * (angle + gyro_rate_dps * dt) + (1.0f - alpha) * accel_angle;
+		pitch = alpha * (pitch + pitch_rate_dps * dt) + (1.0f - alpha) * pitch_accel;
+		roll  = alpha * (roll  + roll_rate_dps  * dt) + (1.0f - alpha) * roll_accel;
 
-		DebugCheckpoint();  // breakpoint by FUNCTION NAME, not line number -- survives rebuilds
+		uint8_t mag_raw[6];
+		QMC_ReadMulti(0x00, mag_raw, 6);
+		int16_t mag_x = (int16_t)((mag_raw[1] << 8) | mag_raw[0]);
+		int16_t mag_y = (int16_t)((mag_raw[3] << 8) | mag_raw[2]);
+		int16_t mag_z = (int16_t)((mag_raw[5] << 8) | mag_raw[4]);
+
+		float pitch_rad = pitch * DEG_TO_RAD;
+		float roll_rad  = roll  * DEG_TO_RAD;
+
+		// ---- Every libm call split onto its own line, into its own
+		// variable, before any combining -- required workaround for a
+		// codegen issue where 2+ float libm calls combined in a single
+		// expression corrupts state and HardFaults on this toolchain. ----
+		float cos_pitch = cosf(pitch_rad);
+		float sin_pitch = sinf(pitch_rad);
+		float cos_roll  = cosf(roll_rad);
+		float sin_roll  = sinf(roll_rad);
+
+		float term1 = (float)mag_x * cos_pitch;
+		float term2 = (float)mag_z * sin_pitch;
+		float Xh = term1 + term2;
+
+		float term3 = (float)mag_x * sin_roll;
+		float term4 = term3 * sin_pitch;
+		float term5 = (float)mag_y * cos_roll;
+		float term6 = (float)mag_z * sin_roll;
+		float term7 = term6 * cos_pitch;
+		float Yh = term4 + term5 - term7;
+
+		float heading = atan2f(Yh, Xh) * RAD_TO_DEG;
+		if (heading < 0.0f) heading += 360.0f;
+
+		DebugCheckpoint();
 	}
 }
