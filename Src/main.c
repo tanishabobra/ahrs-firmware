@@ -215,6 +215,362 @@ void QMC_ReadMulti(uint8_t reg_addr, uint8_t *buffer, uint8_t len)
 	I2C_BusFreeDelay();
 }
 
+// ================= EKF: Multiplicative EKF (MEKF), 6-state =================
+
+typedef struct {
+	float q[4];
+	float b[3];
+	float P[6][6];
+} EKF_State;
+
+static void Mat6_Multiply(float A[6][6], float B[6][6], float out[6][6])
+{
+	for (int i = 0; i < 6; i++) {
+		for (int j = 0; j < 6; j++) {
+			float sum = 0.0f;
+			for (int k = 0; k < 6; k++) {
+				sum = sum + A[i][k] * B[k][j];
+			}
+			out[i][j] = sum;
+		}
+	}
+}
+
+static void Mat6_Transpose(float A[6][6], float out[6][6])
+{
+	for (int i = 0; i < 6; i++) {
+		for (int j = 0; j < 6; j++) {
+			out[j][i] = A[i][j];
+		}
+	}
+}
+
+static void Mat6_Add(float A[6][6], float B[6][6], float out[6][6])
+{
+	for (int i = 0; i < 6; i++) {
+		for (int j = 0; j < 6; j++) {
+			out[i][j] = A[i][j] + B[i][j];
+		}
+	}
+}
+
+static void Quat_Multiply(const float a[4], const float b[4], float out[4])
+{
+	out[0] = a[0]*b[0] - a[1]*b[1] - a[2]*b[2] - a[3]*b[3];
+	out[1] = a[0]*b[1] + a[1]*b[0] + a[2]*b[3] - a[3]*b[2];
+	out[2] = a[0]*b[2] - a[1]*b[3] + a[2]*b[0] + a[3]*b[1];
+	out[3] = a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0];
+}
+
+static void Quat_Normalize(float q[4])
+{
+	float sumsq = q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3];
+	float mag = sqrtf(sumsq);
+	q[0] = q[0] / mag;
+	q[1] = q[1] / mag;
+	q[2] = q[2] / mag;
+	q[3] = q[3] / mag;
+}
+
+static void Quat_Conjugate(const float q[4], float out[4])
+{
+	out[0] =  q[0];
+	out[1] = -q[1];
+	out[2] = -q[2];
+	out[3] = -q[3];
+}
+
+static void Quat_RotateVector(const float q[4], const float v[3], float out[3])
+{
+	float w = q[0], x = q[1], y = q[2], z = q[3];
+	float vx = v[0], vy = v[1], vz = v[2];
+
+	float tx = 2.0f * (y*vz - z*vy);
+	float ty = 2.0f * (z*vx - x*vz);
+	float tz = 2.0f * (x*vy - y*vx);
+
+	out[0] = vx + w*tx + (y*tz - z*ty);
+	out[1] = vy + w*ty + (z*tx - x*tz);
+	out[2] = vz + w*tz + (x*ty - y*tx);
+}
+
+static uint8_t Mat3_Inverse(float A[3][3], float out[3][3])
+{
+	float a = A[0][0], b = A[0][1], c = A[0][2];
+	float d = A[1][0], e = A[1][1], f = A[1][2];
+	float g = A[2][0], h = A[2][1], i = A[2][2];
+
+	float A11 =  (e*i - f*h);
+	float A12 = -(d*i - f*g);
+	float A13 =  (d*h - e*g);
+	float A21 = -(b*i - c*h);
+	float A22 =  (a*i - c*g);
+	float A23 = -(a*h - b*g);
+	float A31 =  (b*f - c*e);
+	float A32 = -(a*f - c*d);
+	float A33 =  (a*e - b*d);
+
+	float det = a*A11 + b*A12 + c*A13;
+	if (fabsf(det) < 1e-9f) return 0;
+
+	float inv_det = 1.0f / det;
+
+	out[0][0] = A11*inv_det; out[0][1] = A21*inv_det; out[0][2] = A31*inv_det;
+	out[1][0] = A12*inv_det; out[1][1] = A22*inv_det; out[1][2] = A32*inv_det;
+	out[2][0] = A13*inv_det; out[2][1] = A23*inv_det; out[2][2] = A33*inv_det;
+
+	return 1;
+}
+
+void EKF_Init(EKF_State *ekf, float init_pitch_deg, float init_roll_deg)
+{
+	float pitch_rad = init_pitch_deg * DEG_TO_RAD;
+	float roll_rad  = init_roll_deg  * DEG_TO_RAD;
+
+	float cp = cosf(pitch_rad * 0.5f);
+	float sp = sinf(pitch_rad * 0.5f);
+	float cr = cosf(roll_rad * 0.5f);
+	float sr = sinf(roll_rad * 0.5f);
+
+	ekf->q[0] = cr*cp;
+	ekf->q[1] = sr*cp;
+	ekf->q[2] = cr*sp;
+	ekf->q[3] = -sr*sp;
+	Quat_Normalize(ekf->q);
+
+	ekf->b[0] = 0.0f;
+	ekf->b[1] = 0.0f;
+	ekf->b[2] = 0.0f;
+
+	for (int i = 0; i < 6; i++) {
+		for (int j = 0; j < 6; j++) {
+			ekf->P[i][j] = (i == j) ? 1.0f : 0.0f;
+		}
+	}
+}
+
+void EKF_Predict(EKF_State *ekf, float gyro_x, float gyro_y, float gyro_z, float dt)
+{
+	float wx = gyro_x - ekf->b[0];
+	float wy = gyro_y - ekf->b[1];
+	float wz = gyro_z - ekf->b[2];
+
+	float half_dt = dt * 0.5f;
+	float dq0 = -half_dt * (wx*ekf->q[1] + wy*ekf->q[2] + wz*ekf->q[3]);
+	float dq1 =  half_dt * (wx*ekf->q[0] + wz*ekf->q[2] - wy*ekf->q[3]);
+	float dq2 =  half_dt * (wy*ekf->q[0] - wz*ekf->q[1] + wx*ekf->q[3]);
+	float dq3 =  half_dt * (wz*ekf->q[0] + wy*ekf->q[1] - wx*ekf->q[2]);
+
+	ekf->q[0] = ekf->q[0] + dq0;
+	ekf->q[1] = ekf->q[1] + dq1;
+	ekf->q[2] = ekf->q[2] + dq2;
+	ekf->q[3] = ekf->q[3] + dq3;
+	Quat_Normalize(ekf->q);
+
+	float F[6][6] = {0};
+	F[0][0] = 1.0f;      F[0][1] = -dt*wz;   F[0][2] =  dt*wy;
+	F[1][0] =  dt*wz;    F[1][1] = 1.0f;     F[1][2] = -dt*wx;
+	F[2][0] = -dt*wy;    F[2][1] =  dt*wx;   F[2][2] = 1.0f;
+	F[0][3] = -dt;  F[1][4] = -dt;  F[2][5] = -dt;
+	F[3][3] = 1.0f; F[4][4] = 1.0f; F[5][5] = 1.0f;
+
+	float gyro_noise = 0.0003f;
+	float bias_noise = 0.00001f;
+	float Q[6][6] = {0};
+	Q[0][0] = gyro_noise; Q[1][1] = gyro_noise; Q[2][2] = gyro_noise;
+	Q[3][3] = bias_noise; Q[4][4] = bias_noise; Q[5][5] = bias_noise;
+
+	float Ft[6][6], FP[6][6], FPFt[6][6];
+	Mat6_Transpose(F, Ft);
+	Mat6_Multiply(F, ekf->P, FP);
+	Mat6_Multiply(FP, Ft, FPFt);
+	Mat6_Add(FPFt, Q, ekf->P);
+}
+
+static void EKF_UpdateVector(EKF_State *ekf, float meas_body[3], float ref_world[3], float noise)
+{
+	float q_conj[4];
+	Quat_Conjugate(ekf->q, q_conj);
+	float y_pred[3];
+	Quat_RotateVector(q_conj, ref_world, y_pred);
+
+	float innov[3];
+	innov[0] = meas_body[0] - y_pred[0];
+	innov[1] = meas_body[1] - y_pred[1];
+	innov[2] = meas_body[2] - y_pred[2];
+
+	float H[3][6] = {0};
+	H[0][1] = -y_pred[2]; H[0][2] =  y_pred[1];
+	H[1][0] =  y_pred[2]; H[1][2] = -y_pred[0];
+	H[2][0] = -y_pred[1]; H[2][1] =  y_pred[0];
+
+	float HP[3][6];
+	for (int i = 0; i < 3; i++) {
+		for (int j = 0; j < 6; j++) {
+			float sum = 0.0f;
+			for (int k = 0; k < 6; k++) {
+				sum = sum + H[i][k] * ekf->P[k][j];
+			}
+			HP[i][j] = sum;
+		}
+	}
+	float S[3][3];
+	for (int i = 0; i < 3; i++) {
+		for (int j = 0; j < 3; j++) {
+			float sum = 0.0f;
+			for (int k = 0; k < 6; k++) {
+				sum = sum + HP[i][k] * H[j][k];
+			}
+			S[i][j] = sum;
+		}
+	}
+	S[0][0] += noise;
+	S[1][1] += noise;
+	S[2][2] += noise;
+
+	float Sinv[3][3];
+	if (!Mat3_Inverse(S, Sinv)) return;
+
+	float PHt[6][3];
+	for (int i = 0; i < 6; i++) {
+		for (int j = 0; j < 3; j++) {
+			float sum = 0.0f;
+			for (int k = 0; k < 6; k++) {
+				sum = sum + ekf->P[i][k] * H[j][k];
+			}
+			PHt[i][j] = sum;
+		}
+	}
+	float K[6][3];
+	for (int i = 0; i < 6; i++) {
+		for (int j = 0; j < 3; j++) {
+			float sum = 0.0f;
+			for (int k = 0; k < 3; k++) {
+				sum = sum + PHt[i][k] * Sinv[k][j];
+			}
+			K[i][j] = sum;
+		}
+	}
+
+	float dx[6];
+	for (int i = 0; i < 6; i++) {
+		float sum = 0.0f;
+		sum = sum + K[i][0]*innov[0];
+		sum = sum + K[i][1]*innov[1];
+		sum = sum + K[i][2]*innov[2];
+		dx[i] = sum;
+	}
+
+	float dq[4];
+	dq[0] = 1.0f;
+	dq[1] = 0.5f * dx[0];
+	dq[2] = 0.5f * dx[1];
+	dq[3] = 0.5f * dx[2];
+	float dq_mag = sqrtf(dq[0]*dq[0] + dq[1]*dq[1] + dq[2]*dq[2] + dq[3]*dq[3]);
+	dq[0] = dq[0] / dq_mag;
+	dq[1] = dq[1] / dq_mag;
+	dq[2] = dq[2] / dq_mag;
+	dq[3] = dq[3] / dq_mag;
+
+	float q_new[4];
+	Quat_Multiply(dq, ekf->q, q_new);
+	ekf->q[0] = q_new[0];
+	ekf->q[1] = q_new[1];
+	ekf->q[2] = q_new[2];
+	ekf->q[3] = q_new[3];
+	Quat_Normalize(ekf->q);
+
+	ekf->b[0] += dx[3];
+	ekf->b[1] += dx[4];
+	ekf->b[2] += dx[5];
+
+	float KH[6][6];
+	for (int i = 0; i < 6; i++) {
+		for (int j = 0; j < 6; j++) {
+			float sum = 0.0f;
+			sum = sum + K[i][0]*H[0][j];
+			sum = sum + K[i][1]*H[1][j];
+			sum = sum + K[i][2]*H[2][j];
+			KH[i][j] = sum;
+		}
+	}
+	float I_KH[6][6];
+	for (int i = 0; i < 6; i++) {
+		for (int j = 0; j < 6; j++) {
+			float identity_val = (i == j) ? 1.0f : 0.0f;
+			I_KH[i][j] = identity_val - KH[i][j];
+		}
+	}
+	float P_new[6][6];
+	for (int i = 0; i < 6; i++) {
+		for (int j = 0; j < 6; j++) {
+			float sum = 0.0f;
+			for (int k = 0; k < 6; k++) {
+				sum = sum + I_KH[i][k] * ekf->P[k][j];
+			}
+			P_new[i][j] = sum;
+		}
+	}
+	for (int i = 0; i < 6; i++) {
+		for (int j = 0; j < 6; j++) {
+			ekf->P[i][j] = P_new[i][j];
+		}
+	}
+}
+
+void EKF_UpdateAccel(EKF_State *ekf, float ax, float ay, float az)
+{
+	float mag = sqrtf(ax*ax + ay*ay + az*az);
+	if (mag < 1e-6f) return;
+	float meas[3];
+	meas[0] = ax / mag;
+	meas[1] = ay / mag;
+	meas[2] = az / mag;
+
+	float ref[3] = {0.0f, 0.0f, 1.0f};
+	float noise = 0.01f;
+
+	EKF_UpdateVector(ekf, meas, ref, noise);
+}
+
+void EKF_UpdateMag(EKF_State *ekf, float mx, float my, float mz)
+{
+	float mag = sqrtf(mx*mx + my*my + mz*mz);
+	if (mag < 1e-6f) return;
+	float meas[3];
+	meas[0] = mx / mag;
+	meas[1] = my / mag;
+	meas[2] = mz / mag;
+
+	float ref[3] = {1.0f, 0.0f, 0.0f};
+	float noise = 0.05f;
+
+	EKF_UpdateVector(ekf, meas, ref, noise);
+}
+
+void Quat_ToEuler(const float q[4], float *pitch_deg, float *roll_deg, float *yaw_deg)
+{
+	float w = q[0], x = q[1], y = q[2], z = q[3];
+
+	float roll_sin = 2.0f * (w*x + y*z);
+	float roll_cos = 1.0f - 2.0f * (x*x + y*y);
+	float roll_rad = atan2f(roll_sin, roll_cos);
+
+	float pitch_sin = 2.0f * (w*y - z*x);
+	if (pitch_sin > 1.0f) pitch_sin = 1.0f;
+	if (pitch_sin < -1.0f) pitch_sin = -1.0f;
+	float pitch_rad = asinf(pitch_sin);
+
+	float yaw_sin = 2.0f * (w*z + x*y);
+	float yaw_cos = 1.0f - 2.0f * (y*y + z*z);
+	float yaw_rad = atan2f(yaw_sin, yaw_cos);
+
+	*roll_deg  = roll_rad  * RAD_TO_DEG;
+	*pitch_deg = pitch_rad * RAD_TO_DEG;
+	*yaw_deg   = yaw_rad   * RAD_TO_DEG;
+	if (*yaw_deg < 0.0f) *yaw_deg += 360.0f;
+}
+
 int main(void)
 {
 	FPU_Enable();
@@ -278,15 +634,16 @@ int main(void)
 
 	for (volatile int d = 0; d < 20000; d++);
 
-	float alpha = 0.98f;
-
 	uint8_t accel_raw[6];
 	I2C_ReadMulti(0x3B, accel_raw, 6);
 	int16_t accel_x = (int16_t)((accel_raw[0] << 8) | accel_raw[1]);
 	int16_t accel_y = (int16_t)((accel_raw[2] << 8) | accel_raw[3]);
 	int16_t accel_z = (int16_t)((accel_raw[4] << 8) | accel_raw[5]);
-	float pitch = atan2f((float)accel_x, (float)accel_z) * RAD_TO_DEG;
-	float roll  = atan2f((float)accel_y, (float)accel_z) * RAD_TO_DEG;
+	float init_pitch = atan2f((float)accel_x, (float)accel_z) * RAD_TO_DEG;
+	float init_roll  = atan2f((float)accel_y, (float)accel_z) * RAD_TO_DEG;
+
+	EKF_State ekf;
+	EKF_Init(&ekf, init_pitch, init_roll);
 
 	uint32_t last_ticks = system_ticks_ms;
 
@@ -295,23 +652,29 @@ int main(void)
 		uint32_t elapsed_ms = now_ticks - last_ticks;
 		last_ticks = now_ticks;
 		float dt = elapsed_ms / 1000.0f;
+		if (dt <= 0.0f) dt = 0.001f;
 
 		I2C_ReadMulti(0x3B, accel_raw, 6);
 		accel_x = (int16_t)((accel_raw[0] << 8) | accel_raw[1]);
 		accel_y = (int16_t)((accel_raw[2] << 8) | accel_raw[3]);
 		accel_z = (int16_t)((accel_raw[4] << 8) | accel_raw[5]);
-		float pitch_accel = atan2f((float)accel_x, (float)accel_z) * RAD_TO_DEG;
-		float roll_accel  = atan2f((float)accel_y, (float)accel_z) * RAD_TO_DEG;
 
 		uint8_t gyro_raw[6];
 		I2C_ReadMulti(0x43, gyro_raw, 6);
 		int16_t gyro_x = (int16_t)((gyro_raw[0] << 8) | gyro_raw[1]);
 		int16_t gyro_y = (int16_t)((gyro_raw[2] << 8) | gyro_raw[3]);
-		float pitch_rate_dps = gyro_x / 131.0f;
-		float roll_rate_dps  = gyro_y / 131.0f;
+		int16_t gyro_z = (int16_t)((gyro_raw[4] << 8) | gyro_raw[5]);
 
-		pitch = alpha * (pitch + pitch_rate_dps * dt) + (1.0f - alpha) * pitch_accel;
-		roll  = alpha * (roll  + roll_rate_dps  * dt) + (1.0f - alpha) * roll_accel;
+		float gyro_x_dps = gyro_x / 131.0f;
+		float gyro_y_dps = gyro_y / 131.0f;
+		float gyro_z_dps = gyro_z / 131.0f;
+		float gyro_x_rad = gyro_x_dps * DEG_TO_RAD;
+		float gyro_y_rad = gyro_y_dps * DEG_TO_RAD;
+		float gyro_z_rad = gyro_z_dps * DEG_TO_RAD;
+
+		EKF_Predict(&ekf, gyro_x_rad, gyro_y_rad, gyro_z_rad, dt);
+
+		EKF_UpdateAccel(&ekf, (float)accel_x, (float)accel_y, (float)accel_z);
 
 		uint8_t mag_raw[6];
 		QMC_ReadMulti(0x00, mag_raw, 6);
@@ -319,31 +682,10 @@ int main(void)
 		int16_t mag_y = (int16_t)((mag_raw[3] << 8) | mag_raw[2]);
 		int16_t mag_z = (int16_t)((mag_raw[5] << 8) | mag_raw[4]);
 
-		float pitch_rad = pitch * DEG_TO_RAD;
-		float roll_rad  = roll  * DEG_TO_RAD;
+		EKF_UpdateMag(&ekf, (float)mag_x, (float)mag_y, (float)mag_z);
 
-		// ---- Every libm call split onto its own line, into its own
-		// variable, before any combining -- required workaround for a
-		// codegen issue where 2+ float libm calls combined in a single
-		// expression corrupts state and HardFaults on this toolchain. ----
-		float cos_pitch = cosf(pitch_rad);
-		float sin_pitch = sinf(pitch_rad);
-		float cos_roll  = cosf(roll_rad);
-		float sin_roll  = sinf(roll_rad);
-
-		float term1 = (float)mag_x * cos_pitch;
-		float term2 = (float)mag_z * sin_pitch;
-		float Xh = term1 + term2;
-
-		float term3 = (float)mag_x * sin_roll;
-		float term4 = term3 * sin_pitch;
-		float term5 = (float)mag_y * cos_roll;
-		float term6 = (float)mag_z * sin_roll;
-		float term7 = term6 * cos_pitch;
-		float Yh = term4 + term5 - term7;
-
-		float heading = atan2f(Yh, Xh) * RAD_TO_DEG;
-		if (heading < 0.0f) heading += 360.0f;
+		float pitch_deg, roll_deg, yaw_deg;
+		Quat_ToEuler(ekf.q, &pitch_deg, &roll_deg, &yaw_deg);
 
 		DebugCheckpoint();
 	}
