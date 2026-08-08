@@ -571,6 +571,81 @@ void Quat_ToEuler(const float q[4], float *pitch_deg, float *roll_deg, float *ya
 	if (*yaw_deg < 0.0f) *yaw_deg += 360.0f;
 }
 
+// ================= Telemetry UART (USART2, PA2=TX, ST-LINK VCP) =================
+
+#define TELEM_SR   (*(volatile uint32_t*) 0x40004400)
+#define TELEM_DR   (*(volatile uint32_t*) 0x40004404)
+#define TELEM_BRR  (*(volatile uint32_t*) 0x40004408)
+#define TELEM_CR1  (*(volatile uint32_t*) 0x4000440C)
+
+void Telemetry_UART_Init(void)
+{
+	*(volatile uint32_t*) 0x40023830 |= (1 << 0);   // RCC_AHB1ENR: GPIOAEN
+	(void) *(volatile uint32_t*) 0x40023830;
+
+	*(volatile uint32_t*) 0x40020000 &= ~(3u << 4);  // PA2 MODER
+	*(volatile uint32_t*) 0x40020000 |=  (2u << 4);  // AF mode
+
+	*(volatile uint32_t*) 0x40020008 &= ~(3u << 4);  // OSPEEDR
+	*(volatile uint32_t*) 0x40020008 |=  (3u << 4);
+
+	*(volatile uint32_t*) 0x40020020 &= ~(0xFu << 8);  // AFRL, PA2
+	*(volatile uint32_t*) 0x40020020 |=  (7u   << 8);  // AF7 = USART2
+
+	*(volatile uint32_t*) 0x40023840 |= (1 << 17);  // RCC_APB1ENR: USART2EN
+	(void) *(volatile uint32_t*) 0x40023840;
+
+	TELEM_CR1 = 0;
+	TELEM_BRR = 0x8B;          // 115200 baud @ 16MHz APB1
+	TELEM_CR1 |= (1 << 3);     // TE
+	TELEM_CR1 |= (1 << 13);    // UE, last
+}
+
+static void Telemetry_SendByte(uint8_t c)
+{
+	while (!(TELEM_SR & (1 << 7))) {}
+	TELEM_DR = c;
+}
+
+static void Telemetry_SendString(const char *s)
+{
+	while (*s) { Telemetry_SendByte((uint8_t)*s); s++; }
+}
+
+static void Telemetry_SendFloat(float val, uint8_t decimals)
+{
+	if (val < 0.0f) { Telemetry_SendByte('-'); val = -val; }
+	int32_t whole = (int32_t)val;
+	float frac = val - (float)whole;
+
+	char tmp[12];
+	int i = 0;
+	if (whole == 0) {
+		tmp[i++] = '0';
+	} else {
+		while (whole > 0) { tmp[i++] = '0' + (whole % 10); whole /= 10; }
+	}
+	while (i > 0) { Telemetry_SendByte(tmp[--i]); }
+
+	Telemetry_SendByte('.');
+	for (uint8_t d = 0; d < decimals; d++) {
+		frac *= 10.0f;
+		int digit = (int)frac;
+		if (digit > 9) digit = 9;
+		Telemetry_SendByte((uint8_t)('0' + digit));
+		frac -= (float)digit;
+	}
+}
+
+void Telemetry_SendQuat(const float q[4])
+{
+	Telemetry_SendString("q,");
+	Telemetry_SendFloat(q[0], 4); Telemetry_SendByte(',');
+	Telemetry_SendFloat(q[1], 4); Telemetry_SendByte(',');
+	Telemetry_SendFloat(q[2], 4); Telemetry_SendByte(',');
+	Telemetry_SendFloat(q[3], 4); Telemetry_SendByte('\n');
+}
+
 // ================= GPS UART (USART6, PC6=TX/CN10 pin4, PC7=RX/D9) + NMEA parsing =================
 
 // Define this to compile in the physical-layer and UART peripheral diagnostics
@@ -837,6 +912,8 @@ int main(void)
 
 	LED_Init();
 	GPS_UART_Init();
+	Telemetry_UART_Init();
+
 
 #ifdef GPS_WIRE_DIAGNOSTIC
 	GPIO_LoopbackTest();
@@ -934,6 +1011,12 @@ int main(void)
 
 		float pitch_deg, roll_deg, yaw_deg;
 		Quat_ToEuler(ekf.q, &pitch_deg, &roll_deg, &yaw_deg);
+
+		static uint32_t last_telem_ticks = 0;
+		if (now_ticks - last_telem_ticks >= 20) {
+			Telemetry_SendQuat(ekf.q);
+			last_telem_ticks = now_ticks;
+		}
 
 		GPS_UART_Poll();
 		if (nmea_sentence_ready) {
