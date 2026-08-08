@@ -571,71 +571,130 @@ void Quat_ToEuler(const float q[4], float *pitch_deg, float *roll_deg, float *ya
 	if (*yaw_deg < 0.0f) *yaw_deg += 360.0f;
 }
 
-// ================= GPS UART (USART2, PA2=TX/PA3=RX) + NMEA parsing =================
-// Uses USART2 because the physical wire is on the pin labeled "RX" (D0),
-// which is PA3 -- part of USART2, not USART1.
+// ================= GPS UART (USART6, PC6=TX/CN10 pin4, PC7=RX/D9) + NMEA parsing =================
 
-#define USART2_SR   (*(volatile uint32_t*) 0x40004400)
-#define USART2_DR   (*(volatile uint32_t*) 0x40004404)
-#define USART2_BRR  (*(volatile uint32_t*) 0x40004408)
-#define USART2_CR1  (*(volatile uint32_t*) 0x4000440C)
+// Define this to compile in the physical-layer and UART peripheral diagnostics
+// used to debug the PC6/PC7 wiring. Leave undefined for normal builds.
+// #define GPS_WIRE_DIAGNOSTIC
+
+#define USART6_SR   (*(volatile uint32_t*) 0x40011400)
+#define USART6_DR   (*(volatile uint32_t*) 0x40011404)
+#define USART6_BRR  (*(volatile uint32_t*) 0x40011408)
+#define USART6_CR1  (*(volatile uint32_t*) 0x4001140C)
 
 void GPS_UART_Init(void)
 {
-	*(volatile uint32_t*) 0x40023830 |= (1 << 0);   // GPIOA clock (idempotent)
+	*(volatile uint32_t*) 0x40023830 |= (1 << 2);   // RCC_AHB1ENR: GPIOCEN
+	(void) *(volatile uint32_t*) 0x40023830;
 
-	// PA2 = TX, PA3 = RX, Alternate Function mode
-	*(volatile uint32_t*) 0x40020000 &= ~((3 << 4) | (3 << 6));
-	*(volatile uint32_t*) 0x40020000 |=  ((2 << 4) | (2 << 6));
+	*(volatile uint32_t*) 0x40020800 &= ~((3u << 12) | (3u << 14));
+	*(volatile uint32_t*) 0x40020800 |=  ((2u << 12) | (2u << 14));
 
-	// High speed
-	*(volatile uint32_t*) 0x40020008 &= ~((3 << 4) | (3 << 6));
-	*(volatile uint32_t*) 0x40020008 |=  ((3 << 4) | (3 << 6));
+	*(volatile uint32_t*) 0x40020808 &= ~((3u << 12) | (3u << 14));
+	*(volatile uint32_t*) 0x40020808 |=  ((3u << 12) | (3u << 14));
 
-	// AFRL: AF7 = USART2 -- pin2 (TX) bits[11:8], pin3 (RX) bits[15:12]
-	*(volatile uint32_t*) 0x40020020 &= ~((0xF << 8) | (0xF << 12));
-	*(volatile uint32_t*) 0x40020020 |=  ((7 << 8) | (7 << 12));
+	*(volatile uint32_t*) 0x40020820 &= ~((0xFu << 24) | (0xFu << 28));
+	*(volatile uint32_t*) 0x40020820 |=  ((8u   << 24) | (8u   << 28));
 
-	*(volatile uint32_t*) 0x40023840 |= (1 << 17);   // RCC_APB1ENR: USART2EN
+	*(volatile uint32_t*) 0x40023844 |= (1 << 5);   // RCC_APB2ENR: USART6EN
+	(void) *(volatile uint32_t*) 0x40023844;
 
-	USART2_CR1 = 0;
-	USART2_BRR = 0x683;         // 9600 baud @ 16MHz APB1 clock
-	USART2_CR1 |= (1 << 3);     // TE
-	USART2_CR1 |= (1 << 2);     // RE
-	USART2_CR1 |= (1 << 13);    // UE, last
+	USART6_CR1 = 0;
+	USART6_BRR = 0x683;         // 9600 baud @ 16MHz APB2
+	USART6_CR1 |= (1 << 3);     // TE
+	USART6_CR1 |= (1 << 2);     // RE
+	USART6_CR1 |= (1 << 5);     // RXNEIE
+	USART6_CR1 |= (1 << 13);    // UE, last
+
+	*(volatile uint32_t*) 0xE000E108 |= (1 << 7);   // NVIC_ISER2 bit 7 = IRQ71 (USART6)
 }
 
 static uint8_t GPS_UART_ByteAvailable(void)
 {
-	return (USART2_SR & (1 << 5)) != 0;   // RXNE
+	return (USART6_SR & (1 << 5)) != 0;
 }
 
 static uint8_t GPS_UART_ReadByte(void)
 {
-	return (uint8_t)(USART2_DR & 0xFF);
+	return (uint8_t)(USART6_DR & 0xFF);
 }
+
+static void GPS_UART_SendByte(uint8_t c)
+{
+	while (!(USART6_SR & (1 << 7))) {}
+	USART6_DR = c;
+}
+
+static void GPS_UART_SendString(const char *s)
+{
+	while (*s) {
+		GPS_UART_SendByte((uint8_t)*s);
+		s++;
+	}
+}
+
+#define GPS_RING_SIZE 128
+static volatile uint8_t  gps_ring_buf[GPS_RING_SIZE];
+static volatile uint16_t gps_ring_head = 0;
+static volatile uint16_t gps_ring_tail = 0;
+
+void USART6_IRQHandler(void)
+{
+	if (USART6_SR & (1 << 5)) {
+		uint8_t c = (uint8_t)(USART6_DR & 0xFF);
+		uint16_t next_head = (gps_ring_head + 1) % GPS_RING_SIZE;
+		if (next_head != gps_ring_tail) {
+			gps_ring_buf[gps_ring_head] = c;
+			gps_ring_head = next_head;
+		}
+	}
+}
+
+static uint8_t GPS_Ring_ByteAvailable(void)
+{
+	return gps_ring_head != gps_ring_tail;
+}
+
+static uint8_t GPS_Ring_ReadByte(void)
+{
+	uint8_t c = gps_ring_buf[gps_ring_tail];
+	gps_ring_tail = (gps_ring_tail + 1) % GPS_RING_SIZE;
+	return c;
+}
+
+#ifdef GPS_WIRE_DIAGNOSTIC
+void GPIO_LoopbackTest(void)
+{
+	*(volatile uint32_t*) 0x40020800 &= ~((3u << 12) | (3u << 14));
+	*(volatile uint32_t*) 0x40020800 |=  (1u << 12);
+
+	*(volatile uint32_t*) 0x40020814 |= (1 << 6);
+	DebugCheckpoint();
+
+	*(volatile uint32_t*) 0x40020814 &= ~(1 << 6);
+	DebugCheckpoint();
+}
+#endif
 
 #define NMEA_BUF_SIZE 96
 static char nmea_buf[NMEA_BUF_SIZE];
 static uint8_t nmea_idx = 0;
 static volatile uint8_t nmea_sentence_ready = 0;
 
-// Call once per main loop iteration.
-
 void GPS_UART_Poll(void)
 {
-	if (!GPS_UART_ByteAvailable()) return;
-
-	uint8_t c = GPS_UART_ReadByte();
-	if (c == '\n') {
-		nmea_buf[nmea_idx] = '\0';
-		nmea_sentence_ready = 1;
-		nmea_idx = 0;
-	} else if (c != '\r') {
-		if (nmea_idx < NMEA_BUF_SIZE - 1) {
-			nmea_buf[nmea_idx++] = c;
-		} else {
+	while (GPS_Ring_ByteAvailable()) {
+		uint8_t c = GPS_Ring_ReadByte();
+		if (c == '\n') {
+			nmea_buf[nmea_idx] = '\0';
+			nmea_sentence_ready = 1;
 			nmea_idx = 0;
+		} else if (c != '\r') {
+			if (nmea_idx < NMEA_BUF_SIZE - 1) {
+				nmea_buf[nmea_idx++] = c;
+			} else {
+				nmea_idx = 0;
+			}
 		}
 	}
 }
@@ -778,6 +837,18 @@ int main(void)
 
 	LED_Init();
 	GPS_UART_Init();
+
+#ifdef GPS_WIRE_DIAGNOSTIC
+	GPIO_LoopbackTest();
+	GPS_UART_Init();
+
+	GPS_UART_SendByte('A');
+	for (volatile int d = 0; d < 200000; d++);
+	uint32_t diag_sr = USART6_SR;
+	uint8_t diag_rxne = (diag_sr >> 5) & 1;
+	uint8_t diag_rx_byte = diag_rxne ? (uint8_t)(USART6_DR & 0xFF) : 0;
+	DebugCheckpoint();
+#endif
 
 	uint8_t mpu_ok = (I2C_ReadRegister(0x75) == 0x70);
 	uint8_t qmc_ok = (QMC_ReadRegister(0x0D) == 0xFF);
