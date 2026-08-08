@@ -97,7 +97,7 @@ STM32CubeIDE, no HAL. Build, then flash via Run or Debug with the board on ST-LI
 ## Live 3D visualizer
 
 Orientation quaternion streams over USART2 (PA2), which rides the same USB cable as the
-ST-LINK VCP — no extra wiring.
+ST-LINK VCP
 
 ```bash
 pip install pyserial numpy matplotlib
